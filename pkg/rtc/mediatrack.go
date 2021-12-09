@@ -32,6 +32,7 @@ var (
 
 const (
 	lostUpdateDelta         = time.Second
+	lastUpdateDelta         = 5 * time.Second
 	layerSelectionTolerance = 0.8
 )
 
@@ -65,6 +66,10 @@ type MediaTrack struct {
 	maxUpFracLost     uint8
 	maxUpFracLostTs   time.Time
 
+	done chan bool
+	// feedback
+	Feedback *MediaFeedback
+
 	onClose []func()
 }
 
@@ -82,12 +87,35 @@ type MediaTrackParams struct {
 	Logger              logger.Logger
 }
 
+type MediaStats struct {
+	FractionLost    uint8
+	PacketsLost     uint32
+	PacketsReceived uint32
+	Delay           uint32
+	BytesIn         uint64
+	NumReports      uint32
+}
+
+type MediaFeedback struct {
+	lock        sync.Mutex
+	Curr        *MediaStats
+	Prev        *MediaStats
+	LastUpdated time.Time
+	Score       float64
+}
+
+func newMediaFeedback() *MediaFeedback {
+	return &MediaFeedback{Curr: &MediaStats{}}
+}
+
 func NewMediaTrack(track *webrtc.TrackRemote, params MediaTrackParams) *MediaTrack {
 	t := &MediaTrack{
 		params:   params,
 		ssrc:     track.SSRC(),
 		streamID: track.StreamID(),
 		codec:    track.Codec(),
+		Feedback: newMediaFeedback(),
+		done:     make(chan bool),
 	}
 
 	if params.TrackInfo.Muted {
@@ -97,7 +125,16 @@ func NewMediaTrack(track *webrtc.TrackRemote, params MediaTrackParams) *MediaTra
 	if params.TrackInfo != nil && t.Kind() == livekit.TrackType_VIDEO {
 		t.UpdateVideoLayers(params.TrackInfo.Layers)
 	}
+	// start the stats worker
+	go t.updateStats()
+	// add a cleanup function to be called on close
+	t.AddOnClose(t.cleanup)
+
 	return t
+}
+
+func (t *MediaTrack) cleanup() {
+	close(t.done)
 }
 
 func (t *MediaTrack) ID() string {
@@ -548,37 +585,62 @@ func (t *MediaTrack) sendDownTrackBindingReports(sub types.Participant) {
 	}()
 }
 
+func (t *MediaTrack) updateStats() {
+	for {
+		select {
+		case _, ok := <-t.done:
+			if !ok {
+				return
+			}
+		case <-time.After(lastUpdateDelta):
+			var stats buffer.Stats
+			t.lock.RLock()
+			if t.buffer != nil {
+				stats = t.buffer.GetStats()
+			}
+			t.lock.RUnlock()
+
+			feedback := t.Feedback
+			feedback.lock.Lock()
+			current := feedback.Curr
+			current.PacketsReceived = stats.PacketCount
+			feedback.lock.Unlock()
+		}
+	}
+
+}
+
 func (t *MediaTrack) handlePublisherFeedback(packets []rtcp.Packet) {
-	var maxLost uint8
-	var hasReport bool
+	feedback := t.Feedback
+	feedback.lock.Lock()
+	defer feedback.lock.Unlock()
+	current := feedback.Curr
+	current.NumReports++
+	now := time.Now()
+
 	for _, p := range packets {
 		switch pkt := p.(type) {
 		// sfu.Buffer generates ReceiverReports for the publisher
 		case *rtcp.ReceiverReport:
 			for _, rr := range pkt.Reports {
-				if rr.FractionLost > maxLost {
-					maxLost = rr.FractionLost
-				}
-				hasReport = true
+				current.FractionLost += rr.FractionLost
+				current.PacketsLost += rr.TotalLost
+				current.Delay += rr.Delay
 			}
 		}
 	}
 
-	if hasReport {
-		t.fracLostLock.Lock()
-		if maxLost > t.maxUpFracLost {
-			t.maxUpFracLost = maxLost
+	if now.Sub(feedback.LastUpdated) > lastUpdateDelta {
+		// calculate score and store it
+		if t.Kind() == livekit.TrackType_AUDIO {
+			feedback.Score = calculateAudioScore(current, feedback.Prev)
+		} else {
+			feedback.Score = calculateVideoScore(current, feedback.Prev, t.params.TrackInfo.Height, t.params.TrackInfo.Width)
 		}
-
-		now := time.Now()
-		if now.Sub(t.maxUpFracLostTs) > lostUpdateDelta {
-			atomic.StoreUint32(&t.currentUpFracLost, uint32(t.maxUpFracLost))
-			t.maxUpFracLost = 0
-			t.maxUpFracLostTs = now
-		}
-		t.fracLostLock.Unlock()
+		feedback.Prev = current
+		feedback.Curr = &MediaStats{}
+		feedback.LastUpdated = now
 	}
-
 	// also look for sender reports
 	// feedback for the source RTCP
 	t.params.RTCPChan <- packets
